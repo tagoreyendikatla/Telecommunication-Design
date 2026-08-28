@@ -44,14 +44,12 @@
 const F_ZERO = 1200;
 const F_ONE  = 2000;
 const F_SOF  = 3000;
-const BIT_DURATION = 0.50;
-const SOF_DURATION = 1.50;
+const BIT_DURATION = 0.30;
+const SOF_DURATION = 1.00;
 
 const FFT_SIZE = 4096;
-const BIN_WINDOW = 2;
-const CALIBRATION_MS = 600;
-const SOF_MARGIN_ABOVE_NOISE = 30;
-const SOF_MARGIN_ABOVE_DATA = 15;
+const SOF_MIN_MAG = 140;
+const SOF_MARGIN = 25;
 
 let pyodide = null;
 
@@ -88,14 +86,6 @@ function freqToBin(freq, sampleRate, fftSize) {
   return Math.round(freq * fftSize / sampleRate);
 }
 
-function bandEnergy(freqData, centerBin, window) {
-  let sum = 0;
-  for (let b = centerBin - window; b <= centerBin + window; b++) {
-    if (b >= 0 && b < freqData.length) sum += freqData[b];
-  }
-  return sum;
-}
-
 async function listen() {
   const status = document.getElementById("status");
   const bitTrack = document.getElementById("bitTrack");
@@ -104,7 +94,7 @@ async function listen() {
 
   status.textContent = "Requesting microphone...";
   const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true }
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
   });
 
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -125,27 +115,16 @@ async function listen() {
   function sampleLoop() {
     if (!running) return;
     analyser.getByteFrequencyData(freqData);
-    latest = {
-      zero: bandEnergy(freqData, binZero, BIN_WINDOW),
-      one: bandEnergy(freqData, binOne, BIN_WINDOW),
-      sof: bandEnergy(freqData, binSof, BIN_WINDOW),
-    };
-    const maxPossible = 255 * (2 * BIN_WINDOW + 1);
-    document.getElementById("f0Fill").style.width = (latest.zero / maxPossible * 100) + "%";
-    document.getElementById("f1Fill").style.width = (latest.one / maxPossible * 100) + "%";
-    document.getElementById("sofFill").style.width = (latest.sof / maxPossible * 100) + "%";
+    latest = { zero: freqData[binZero], one: freqData[binOne], sof: freqData[binSof] };
+    document.getElementById("f0Fill").style.width = (latest.zero / 255 * 100) + "%";
+    document.getElementById("f1Fill").style.width = (latest.one / 255 * 100) + "%";
+    document.getElementById("sofFill").style.width = (latest.sof / 255 * 100) + "%";
     requestAnimationFrame(sampleLoop);
   }
   sampleLoop();
 
-  status.textContent = "Calibrating to room noise - stay quiet...";
-  await new Promise((r) => setTimeout(r, CALIBRATION_MS));
-  const noiseFloor = { zero: latest.zero, one: latest.one, sof: latest.sof };
-
   function isSof(s) {
-    return (s.sof - noiseFloor.sof) > SOF_MARGIN_ABOVE_NOISE &&
-           (s.sof - s.zero) > SOF_MARGIN_ABOVE_DATA &&
-           (s.sof - s.one) > SOF_MARGIN_ABOVE_DATA;
+    return s.sof > SOF_MIN_MAG && (s.sof - s.zero) > SOF_MARGIN && (s.sof - s.one) > SOF_MARGIN;
   }
 
   function waitUntil(targetTime) {
