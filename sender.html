@@ -1,0 +1,171 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sender - Sound Transmitter</title>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 0 auto; padding: 16px; background:#111; color:#eee; }
+  h2 { text-align:center; }
+  label { display:block; margin-top: 12px; font-size: 14px; color:#aaa; }
+  input { width: 100%; box-sizing: border-box; padding: 10px; font-size: 16px; margin-top: 4px;
+          border-radius: 6px; border: 1px solid #444; background:#222; color:#eee; }
+  button { width: 100%; padding: 14px; font-size: 16px; margin-top: 16px; border: none;
+           border-radius: 8px; cursor: pointer; font-weight: bold; }
+  #genBtn { background: #2563eb; color: white; }
+  #txBtn { background: #16a34a; color: white; }
+  #txBtn:disabled, #genBtn:disabled { background: #444; color: #888; cursor: not-allowed; }
+  pre { background:#000; padding: 10px; border-radius: 6px; white-space: pre-wrap;
+        word-break: break-all; font-size: 13px; min-height: 20px; }
+  #status { margin-top: 10px; font-size: 14px; color: #9cf; min-height: 20px; }
+  #progressBar { height: 8px; background:#333; border-radius:4px; margin-top:8px; overflow:hidden; }
+  #progressFill { height: 100%; width:0%; background:#16a34a; transition: width 0.1s linear; }
+</style>
+</head>
+<body>
+<h2>&#128266; Sender</h2>
+
+<label>Message 1 (bits)</label>
+<input id="msg1" placeholder="e.g. 101101110">
+
+<label>Message 2 (bits)</label>
+<input id="msg2" placeholder="e.g. 1100101">
+
+<label>Error position in message 1 (-1 for none)</label>
+<input id="err1" type="number" value="-1">
+
+<label>Error position in message 2 (-1 for none)</label>
+<input id="err2" type="number" value="-1">
+
+<button id="genBtn" disabled>Loading Python engine...</button>
+<pre id="encodedOut"></pre>
+
+<button id="txBtn" disabled>Transmit via Sound</button>
+<div id="progressBar"><div id="progressFill"></div></div>
+<div id="status">Loading Pyodide (first load can take ~10-20s)...</div>
+
+<script>
+// ---------------------------------------------------------------------
+// Physical-layer constants - MUST MATCH receiver.html exactly
+// ---------------------------------------------------------------------
+const F_ZERO = 1200;   // Hz -> bit 0
+const F_ONE  = 2000;   // Hz -> bit 1
+const F_SOF  = 3000;   // Hz -> start-of-frame marker
+const BIT_DURATION = 0.30;   // seconds per bit
+const SOF_DURATION = 1.00;   // seconds for the start marker
+const LEAD_IN = 0.20;         // seconds of silence before SOF
+
+let pyodide = null;
+let encodedBits = "";
+
+async function boot() {
+  pyodide = await loadPyodide();
+  document.getElementById("genBtn").disabled = false;
+  document.getElementById("genBtn").textContent = "Generate Encoded Sequence";
+  document.getElementById("status").textContent = "Ready.";
+}
+boot();
+
+// Run the user's ACTUAL encode.py, unmodified, feeding it the four
+// input() answers it expects, and capturing everything it print()s.
+async function runEncode(msg1, msg2, err1, err2) {
+  const code = await (await fetch("encode.py")).text();
+  pyodide.globals.set("_inputs", pyodide.toPy([msg1, msg2, String(err1), String(err2)]));
+  pyodide.runPython(`
+import sys, io, builtins
+_input_iter = iter(_inputs)
+def _mock_input(prompt=''):
+    return next(_input_iter)
+builtins.input = _mock_input
+_buf = io.StringIO()
+_old_stdout = sys.stdout
+sys.stdout = _buf
+`);
+  pyodide.runPython(code);
+  const out = pyodide.runPython(`
+sys.stdout = _old_stdout
+_buf.getvalue()
+`);
+  return out;
+}
+
+document.getElementById("genBtn").onclick = async () => {
+  const msg1 = document.getElementById("msg1").value.trim();
+  const msg2 = document.getElementById("msg2").value.trim();
+  const err1 = document.getElementById("err1").value.trim();
+  const err2 = document.getElementById("err2").value.trim();
+
+  if (!/^[01]+$/.test(msg1) || !/^[01]+$/.test(msg2)) {
+    alert("Messages must be non-empty strings of 0s and 1s.");
+    return;
+  }
+
+  document.getElementById("status").textContent = "Running encode.py...";
+  try {
+    const output = await runEncode(msg1, msg2, err1, err2);
+    document.getElementById("encodedOut").textContent = output;
+    const m = output.match(/Encoded sequence:\s*([01]+)/);
+    if (!m) throw new Error("Could not find 'Encoded sequence:' line in encode.py output");
+    encodedBits = m[1];
+    document.getElementById("txBtn").disabled = false;
+    document.getElementById("status").textContent =
+      `Encoded ${encodedBits.length} bits. Ready to transmit.`;
+  } catch (e) {
+    document.getElementById("status").textContent = "Error: " + e.message;
+  }
+};
+
+// ---------------------------------------------------------------------
+// Physical layer: play the bitstring as a sequence of tones
+// ---------------------------------------------------------------------
+async function transmit(bits) {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  gain.gain.value = 0.9;
+
+  const t0 = ctx.currentTime + LEAD_IN;
+  osc.frequency.setValueAtTime(F_SOF, t0);
+  let t = t0 + SOF_DURATION;
+  for (const bit of bits) {
+    osc.frequency.setValueAtTime(bit === "1" ? F_ONE : F_ZERO, t);
+    t += BIT_DURATION;
+  }
+  osc.start(t0);
+  osc.stop(t + 0.05);
+
+  const totalMs = (t - ctx.currentTime) * 1000;
+  const startWall = performance.now();
+  const bar = document.getElementById("progressFill");
+  const status = document.getElementById("status");
+
+  await new Promise((resolve) => {
+    function tick() {
+      const elapsed = performance.now() - startWall;
+      const pct = Math.min(100, (elapsed / totalMs) * 100);
+      bar.style.width = pct + "%";
+      status.textContent = pct < 100 ? `Transmitting... ${pct.toFixed(0)}%` : "Done.";
+      if (elapsed < totalMs) requestAnimationFrame(tick);
+      else resolve();
+    }
+    tick();
+  });
+
+  osc.disconnect();
+  gain.disconnect();
+}
+
+document.getElementById("txBtn").onclick = () => {
+  if (!encodedBits) return;
+  document.getElementById("txBtn").disabled = true;
+  transmit(encodedBits).then(() => {
+    document.getElementById("txBtn").disabled = false;
+  });
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,205 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Receiver - Sound Listener</title>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 0 auto; padding: 16px; background:#111; color:#eee; }
+  h2 { text-align:center; }
+  button { width: 100%; padding: 14px; font-size: 16px; margin-top: 16px; border: none;
+           border-radius: 8px; cursor: pointer; font-weight: bold; }
+  #listenBtn { background: #2563eb; color: white; }
+  #listenBtn:disabled { background: #444; color: #888; }
+  #status { margin-top: 12px; font-size: 14px; color: #9cf; min-height: 20px; }
+  pre { background:#000; padding: 10px; border-radius: 6px; white-space: pre-wrap;
+        word-break: break-all; font-size: 13px; min-height: 20px; }
+  .meterRow { display:flex; align-items:center; gap:8px; margin-top:6px; font-size:12px; color:#aaa; }
+  .meterBar { flex:1; height:10px; background:#222; border-radius:4px; overflow:hidden; }
+  .meterFill { height:100%; width:0%; }
+  #f0Fill { background:#f59e0b; }
+  #f1Fill { background:#3b82f6; }
+  #sofFill { background:#a855f7; }
+  #bitTrack { font-family: monospace; font-size: 14px; word-break: break-all; margin-top: 8px; color:#0f0; }
+</style>
+</head>
+<body>
+<h2>&#127911; Receiver</h2>
+
+<button id="listenBtn" disabled>Loading Python engine...</button>
+<div id="status">Loading Pyodide (first load can take ~10-20s)...</div>
+
+<div class="meterRow"><span style="width:70px">0-tone</span><div class="meterBar"><div id="f0Fill" class="meterFill"></div></div></div>
+<div class="meterRow"><span style="width:70px">1-tone</span><div class="meterBar"><div id="f1Fill" class="meterFill"></div></div></div>
+<div class="meterRow"><span style="width:70px">SOF-tone</span><div class="meterBar"><div id="sofFill" class="meterFill"></div></div></div>
+
+<div id="bitTrack"></div>
+<pre id="decodedOut"></pre>
+
+<script>
+// ---------------------------------------------------------------------
+// Physical-layer constants - MUST MATCH sender.html exactly
+// ---------------------------------------------------------------------
+const F_ZERO = 1200;
+const F_ONE  = 2000;
+const F_SOF  = 3000;
+const BIT_DURATION = 0.30;
+const SOF_DURATION = 1.00;
+
+const FFT_SIZE = 4096;
+const SOF_MIN_MAG = 140;      // 0-255 scale from getByteFrequencyData
+const SOF_MARGIN = 25;        // SOF bin must beat both data bins by this much
+
+let pyodide = null;
+
+async function boot() {
+  pyodide = await loadPyodide();
+  document.getElementById("listenBtn").disabled = false;
+  document.getElementById("listenBtn").textContent = "Start Listening";
+  document.getElementById("status").textContent = "Ready.";
+}
+boot();
+
+async function runDecode(bitString) {
+  const code = await (await fetch("decode.py")).text();
+  pyodide.globals.set("_inputs", pyodide.toPy([bitString]));
+  pyodide.runPython(`
+import sys, io, builtins
+_input_iter = iter(_inputs)
+def _mock_input(prompt=''):
+    return next(_input_iter)
+builtins.input = _mock_input
+_buf = io.StringIO()
+_old_stdout = sys.stdout
+sys.stdout = _buf
+`);
+  pyodide.runPython(code);
+  const out = pyodide.runPython(`
+sys.stdout = _old_stdout
+_buf.getvalue()
+`);
+  return out;
+}
+
+function freqToBin(freq, sampleRate, fftSize) {
+  return Math.round(freq * fftSize / sampleRate);
+}
+
+async function listen() {
+  const status = document.getElementById("status");
+  const bitTrack = document.getElementById("bitTrack");
+  bitTrack.textContent = "";
+  document.getElementById("decodedOut").textContent = "";
+
+  status.textContent = "Requesting microphone...";
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+  });
+
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaStreamSource(stream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = FFT_SIZE;
+  analyser.smoothingTimeConstant = 0;
+  src.connect(analyser);
+
+  const freqData = new Uint8Array(analyser.frequencyBinCount);
+  const binZero = freqToBin(F_ZERO, ctx.sampleRate, FFT_SIZE);
+  const binOne  = freqToBin(F_ONE, ctx.sampleRate, FFT_SIZE);
+  const binSof  = freqToBin(F_SOF, ctx.sampleRate, FFT_SIZE);
+
+  let latest = { zero: 0, one: 0, sof: 0 };
+  let running = true;
+
+  function sampleLoop() {
+    if (!running) return;
+    analyser.getByteFrequencyData(freqData);
+    latest = { zero: freqData[binZero], one: freqData[binOne], sof: freqData[binSof] };
+    document.getElementById("f0Fill").style.width = (latest.zero / 255 * 100) + "%";
+    document.getElementById("f1Fill").style.width = (latest.one / 255 * 100) + "%";
+    document.getElementById("sofFill").style.width = (latest.sof / 255 * 100) + "%";
+    requestAnimationFrame(sampleLoop);
+  }
+  sampleLoop();
+
+  function isSof(s) {
+    return s.sof > SOF_MIN_MAG && (s.sof - s.zero) > SOF_MARGIN && (s.sof - s.one) > SOF_MARGIN;
+  }
+
+  function waitUntil(targetTime) {
+    return new Promise((resolve) => {
+      function check() {
+        if (ctx.currentTime >= targetTime) resolve();
+        else requestAnimationFrame(check);
+      }
+      check();
+    });
+  }
+
+  // 1. wait for SOF
+  status.textContent = "Waiting for START tone...";
+  let tSof = null;
+  await new Promise((resolve) => {
+    function check() {
+      if (isSof(latest)) { tSof = ctx.currentTime; resolve(); }
+      else requestAnimationFrame(check);
+    }
+    check();
+  });
+  status.textContent = "START detected - syncing...";
+
+  const tDataStart = tSof + SOF_DURATION;
+  let bitIndex = 0;
+  let receivedBits = "";
+
+  async function readBits(n) {
+    let out = "";
+    for (let k = 0; k < n; k++) {
+      const target = tDataStart + (bitIndex + 0.5) * BIT_DURATION;
+      await waitUntil(target);
+      const bit = latest.one > latest.zero ? "1" : "0";
+      out += bit;
+      receivedBits += bit;
+      bitTrack.textContent = receivedBits;
+      bitIndex++;
+    }
+    return out;
+  }
+
+  function binToInt(s) { return parseInt(s, 2); }
+
+  status.textContent = "Reading header...";
+  const len1bits = await readBits(5);
+  const len1 = binToInt(len1bits);
+  await readBits(len1 + 5);   // data1 + parity1
+
+  const len2bits = await readBits(5);
+  const len2 = binToInt(len2bits);
+  await readBits(len2 + 5);   // data2 + parity2
+
+  running = false;
+  stream.getTracks().forEach((t) => t.stop());
+  ctx.close();
+
+  status.textContent = `Received ${receivedBits.length} bits. Running decode.py...`;
+
+  try {
+    const output = await runDecode(receivedBits);
+    document.getElementById("decodedOut").textContent =
+      `Received bitstring:\n${receivedBits}\n\n${output}`;
+    status.textContent = "Done.";
+  } catch (e) {
+    status.textContent = "decode.py error: " + e.message;
+  }
+}
+
+document.getElementById("listenBtn").onclick = () => {
+  document.getElementById("listenBtn").disabled = true;
+  listen().finally(() => {
+    document.getElementById("listenBtn").disabled = false;
+  });
+};
+</script>
+</body>
+</html>
